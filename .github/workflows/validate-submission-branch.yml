@@ -1,0 +1,156 @@
+name: Validate Submission Branch
+
+# NOTE: Requires a self-hosted runner with label "deploy-server" to be
+# registered and online before this workflow can run. See runner setup
+# (Docker-based, no sudo required) — to be deployed separately.
+
+on:
+  push:
+    branches-ignore:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: [self-hosted, deploy-server]
+    steps:
+      - name: Skip if pushed by automation (avoid loop)
+        id: actor_check
+        run: |
+          if [[ "${GITHUB_ACTOR}" == "github-actions[bot]" ]]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout full history
+        if: steps.actor_check.outputs.skip == 'false'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref_name }}
+
+      - name: Fetch students.csv from main
+        if: steps.actor_check.outputs.skip == 'false'
+        run: git show origin/main:students.csv > students.csv
+
+      - name: Record event time
+        if: steps.actor_check.outputs.skip == 'false'
+        id: meta
+        run: echo "event_time=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
+
+      - name: Validate
+        if: steps.actor_check.outputs.skip == 'false'
+        id: validate
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.event.after }}
+        run: |
+          BRANCH_NAME="${GITHUB_REF_NAME}"
+          PUSHER="${GITHUB_ACTOR,,}"
+
+          echo "Branch: $BRANCH_NAME"
+          echo "Pusher: $PUSHER"
+          echo "Before SHA: $BEFORE_SHA"
+          echo "After SHA: $AFTER_SHA"
+
+          if [[ ! "$BRANCH_NAME" =~ ^submissions/([A-Za-z0-9_-]+)$ ]]; then
+            echo "action=delete" >> "$GITHUB_OUTPUT"
+            echo "reason=Branch name '$BRANCH_NAME' does not match required format submissions/<student_code>" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          STUDENT_CODE="${BASH_REMATCH[1]}"
+          echo "student_code=$STUDENT_CODE" >> "$GITHUB_OUTPUT"
+
+          EXPECTED_USERNAME=$(awk -F',' -v code="$STUDENT_CODE" '
+            NR > 1 && tolower($1) == tolower(code) { print tolower($2); exit }
+          ' students.csv)
+
+          if [[ -z "$EXPECTED_USERNAME" ]]; then
+            echo "action=delete" >> "$GITHUB_OUTPUT"
+            echo "reason=No student_code '$STUDENT_CODE' found in students.csv" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "$EXPECTED_USERNAME" == "$PUSHER" ]]; then
+            echo "action=none" >> "$GITHUB_OUTPUT"
+            echo "reason=Push accepted for student_code '$STUDENT_CODE'" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "$BEFORE_SHA" == "0000000000000000000000000000000000000000" ]]; then
+            echo "action=delete" >> "$GITHUB_OUTPUT"
+            echo "reason=Branch created by '$PUSHER', but expected GitHub username for student_code '$STUDENT_CODE' is '$EXPECTED_USERNAME'" >> "$GITHUB_OUTPUT"
+          else
+            echo "action=revert" >> "$GITHUB_OUTPUT"
+            echo "reason=Push by '$PUSHER' rejected — only '$EXPECTED_USERNAME' may push to this branch (student_code '$STUDENT_CODE')" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Notify via commit comment
+        if: steps.actor_check.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REASON: ${{ steps.validate.outputs.reason }}
+          COMMENT_SHA: ${{ github.event.after }}
+          ACTOR: ${{ github.actor }}
+          EVENT_TIME: ${{ steps.meta.outputs.event_time }}
+          ACTION: ${{ steps.validate.outputs.action }}
+          BRANCH_NAME: ${{ github.ref_name }}
+        run: |
+          case "$ACTION" in
+            none)
+              STATUS_LINE="✅ **Push accepted**"
+              OUTCOME_LINE="No action taken. This commit stands on \`$BRANCH_NAME\`."
+              ;;
+            delete)
+              STATUS_LINE="⚠️ **Push rejected**"
+              OUTCOME_LINE="This branch (\`$BRANCH_NAME\`) has been deleted."
+              ;;
+            revert)
+              STATUS_LINE="⚠️ **Push rejected**"
+              OUTCOME_LINE="Branch \`$BRANCH_NAME\` has been reverted to its previous state. This commit was removed from the branch."
+              ;;
+          esac
+
+          BODY=$(cat <<EOF
+          $STATUS_LINE
+
+          | Field | Value |
+          |---|---|
+          | Actor | @$ACTOR |
+          | Time (UTC) | $EVENT_TIME |
+          | Branch | \`$BRANCH_NAME\` |
+          | Reason | $REASON |
+
+          $OUTCOME_LINE
+
+          Reminder: branch names must follow \`submissions/<student_code>\`, and only the GitHub account registered for that student code in \`students.csv\` may push to it.
+          EOF
+          )
+
+          curl -s -X POST \
+            -H "Authorization: token ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/commits/${COMMENT_SHA}/comments" \
+            -d "$(jq -n --arg body "$BODY" '{body: $body}')"
+
+      - name: Delete invalid new branch
+        if: steps.validate.outputs.action == 'delete'
+        run: |
+          echo "REJECTED (delete): ${{ steps.validate.outputs.reason }}"
+          git push origin --delete "${GITHUB_REF_NAME}"
+          exit 1
+
+      - name: Revert unauthorized push on existing branch
+        if: steps.validate.outputs.action == 'revert'
+        run: |
+          echo "REJECTED (revert): ${{ steps.validate.outputs.reason }}"
+          git push origin "${{ github.event.before }}:refs/heads/${GITHUB_REF_NAME}" --force
+          exit 1
+
+      - name: Accepted
+        if: steps.validate.outputs.action == 'none'
+        run: echo "Push accepted for ${GITHUB_REF_NAME}"
