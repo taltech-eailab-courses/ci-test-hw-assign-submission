@@ -116,6 +116,9 @@ jobs:
           esac
 
           BODY=$(cat <<EOF
+          
+          @${PUSHER} 
+          
           $STATUS_LINE
 
           | Field | Value |
